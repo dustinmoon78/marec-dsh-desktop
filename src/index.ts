@@ -227,7 +227,7 @@ export function apply(ctx: Context, config: Config): void {
     // live without a restart.
     const notifyEnabled = storedNotifyOnTaskComplete() ?? config.notifyOnTaskComplete
     if (!notifyEnabled) return
-    if (session.header?.delegationDepth !== 0) return
+    if ((session.header?.delegationDepth ?? 0) !== 0) return
     const e = event as { type?: string; data?: { reason?: { kind?: string } } } | undefined
     if (e?.type !== 'turn/end' || e.data?.reason?.kind !== 'completed') return
     try {
