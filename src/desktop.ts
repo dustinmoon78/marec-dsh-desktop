@@ -25,14 +25,18 @@
  * covering the SPA still booting when the user clicks the tray.
  */
 
-import { Application, Theme } from '@webviewjs/webview'
+import { Application, Notification, Theme } from '@webviewjs/webview'
 import type { BrowserWindow, JsWebview } from '@webviewjs/webview'
 import { JsonWindowStateStore, MIN_HEIGHT, MIN_WIDTH } from './services/state-store.js'
 import { setTitleBarDark, setTitleBarDarkPowerShell } from './services/dwm-theme.js'
+import { osThemeIsLight, refreshOsTheme } from './services/os-theme.js'
 import { resolveLaunchScreen } from './services/screen.js'
 import { WebViewThemeDetector } from './services/theme-sync.js'
 import { WebViewTray, type TrayCommand } from './services/tray.js'
 import { dshFaviconBlack, dshFaviconDark, dshFaviconDataUrl, dshFaviconTray } from './services/icons.js'
+import path from 'node:path'
+import os from 'node:os'
+import fs from 'node:fs'
 
 /** Shell options resolved from the dsh plugin Config schema. */
 export interface DesktopOptions {
@@ -87,6 +91,12 @@ export interface DesktopShellHandle {
    * SPA boot is not lost.
    */
   dispatchEvent(name: string, detail?: Record<string, unknown>): void
+  /**
+   * Show a native Windows notification (task-complete toast). Clicking it
+   * restores the main window, so the user can jump straight back to the
+   * finished conversation even when the window is hidden to the tray.
+   */
+  notifyTaskComplete(body: string): void
   /** Dispose the shell (tray, theme polling, event pump). */
   dispose(): void
 }
@@ -101,10 +111,32 @@ const DARK_BG: [number, number, number] = [24, 24, 27] // #18181b
 const LIGHT_BG: [number, number, number] = [246, 248, 250] // #f6f8fa
 /** dsh's brand accent (matches the SPA boot spinner token). */
 const BRAND = '#3964fe'
+/** Spam guard: never show more than one task toast per cooldown window. */
+const NOTIFY_COOLDOWN_MS = 30_000
 
 /** Decoded once; the theme flips reuse the same buffers. */
 let iconForDark: ReturnType<typeof dshFaviconDark> | undefined
 let iconForLight: ReturnType<typeof dshFaviconDark> | undefined
+/** Taskbar-glyph variants (also decoded once; OS-theme dependent). */
+let taskbarIconForDark: ReturnType<typeof dshFaviconDark> | undefined
+let taskbarIconForLight: ReturnType<typeof dshFaviconDark> | undefined
+
+/**
+ * Taskbar glyph follows the OS theme (the taskbar surface does not follow
+ * the page theme): white whale on a dark taskbar, black whale on a light
+ * one. Refreshed on window focus so an OS theme change while running is
+ * picked up without a restart.
+ */
+function applyTaskbarIcon(w: BrowserWindow): void {
+  const dark = osThemeIsLight() === false
+  const icon = dark ? (taskbarIconForDark ??= dshFaviconDark()) : (taskbarIconForLight ??= dshFaviconBlack())
+  if (icon === undefined) return
+  try {
+    w.setTaskbarIcon(Array.from(icon.data), icon.width, icon.height)
+  } catch {
+    // Best-effort; icon swaps must never break the shell.
+  }
+}
 
 /**
  * Window title-bar icon follows the theme: white whale on dark chrome,
@@ -171,6 +203,12 @@ export function openDesktopShell(
   const store = new JsonWindowStateStore()
   const state = store.load()
   const app = new Application()
+  // WebView2's default-context data directory fails with E_ACCESSDENIED on
+  // some machines; use a dedicated per-app directory (kept app-scoped so
+  // close-to-tray window recreation reuses the same context).
+  const shellDataDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'mg-dsh-desktop', 'browser-data')
+  fs.mkdirSync(shellDataDir, { recursive: true })
+  const shellContext = app.createWebContext({ dataDirectory: shellDataDir })
   const darkByDefault = options.theme !== 'light'
   const splash = splashHtml(darkByDefault, dshFaviconDataUrl())
   const targetUrl = `${BASE_URL}:${port}`
@@ -268,7 +306,7 @@ export function openDesktopShell(
 
     // Splash first: WebView2 keeps it painted while the SPA parses, so the
     // boot shows a smooth themed surface (no white/dark flash frames).
-    const wv = w.createWebview({ html: splash })
+    const wv = w.createWebview({ html: splash, webContext: shellContext })
     webview = wv
     wv.setBackgroundColor(...DARK_BG, 255)
 
@@ -294,13 +332,16 @@ export function openDesktopShell(
       wv.loadUrl(targetUrl)
     }, SPLASH_MS)
 
-    // Taskbar glyph stays white (the taskbar surface does not follow the
-    // page theme); the title-bar icon is set by applyWindowTheme below and
-    // flips with the theme.
-    const icon = dshFaviconDark()
-    if (icon !== undefined) {
-      w.setTaskbarIcon(Array.from(icon.data), icon.width, icon.height)
-    }
+    // Taskbar glyph follows the OS theme (white whale on dark taskbar,
+    // black whale on light); the title-bar icon is set by applyWindowTheme
+    // below and flips with the page theme.
+    applyTaskbarIcon(w)
+    // Re-read the OS theme when the window gains focus, so a system theme
+    // change while running re-picks the correct taskbar glyph.
+    w.on('focus', () => {
+      refreshOsTheme()
+      applyTaskbarIcon(w)
+    })
 
     // Theme: apply the current setting to this window pair. 'system' follows
     // the page's data-ds-dark-theme (150ms polling) and also drives the
@@ -457,7 +498,10 @@ export function openDesktopShell(
 
   tray = new WebViewTray(app, {
     title: options.title,
-    icon: dshFaviconTray(),
+    // The tray surface follows the OS theme, not the page theme: black
+    // whale on a light tray, white whale on a dark one (the tray icon is
+    // set once at creation — a system theme change applies next launch).
+    icon: dshFaviconTray(osThemeIsLight() === false),
   }, {
     onDoubleClick: showWindow,
     onCommand: (command: TrayCommand) => {
@@ -501,6 +545,12 @@ export function openDesktopShell(
   // Non-blocking event pump: dsh's HTTP server and timers keep running on the
   // Node event loop. `ref: true` keeps the process alive while the window is up.
   void app.whenReady({ interval: 33, ref: true })
+
+  // Keep one live reference per toast so the native binding is not collected
+  // before the toast is shown; replaced by each new notification.
+  let activeNotification: Notification | undefined
+  /** Timestamp of the last shown task toast (cooldown bookkeeping). */
+  let lastNotifiedAt = 0
 
   const shell: DesktopShellHandle = {
     app,
@@ -551,6 +601,45 @@ export function openDesktopShell(
       }, 2000)
     },
     dispatchEvent,
+    notifyTaskComplete: (body: string) => {
+      try {
+        // Only remind when the user is NOT looking at the window: a toast
+        // while the shell is visible in the foreground is noise, not a
+        // reminder. Hidden-to-tray and minimized windows still notify.
+        const watching = win !== undefined
+          && !win.isDisposed()
+          && win.isVisible()
+          && !win.isMinimized()
+        if (watching) {
+          console.log('[mg-dsh-desktop] task complete while window visible; skipping toast')
+          return
+        }
+        // Spam guard: at most one toast per cooldown window, so a burst of
+        // completed turns does not stack toasts.
+        const now = Date.now()
+        if (now - lastNotifiedAt < NOTIFY_COOLDOWN_MS) {
+          console.log('[mg-dsh-desktop] task toast throttled by cooldown')
+          return
+        }
+        lastNotifiedAt = now
+        activeNotification?.close()
+        const notification = new Notification(options.title, { body, silent: false })
+        activeNotification = notification
+        // The native callback dispatches asynchronously through a Node
+        // EventEmitter: an 'error' event with no listener crashes the process
+        // (ERR_UNHANDLED_ERROR), so subscribe before anything can fire. A
+        // disabled-notifications OS setting arrives here as a benign error.
+        notification.on('error', (event) => {
+          console.warn(`[mg-dsh-desktop] task notification error:`, event.error?.message ?? event.error)
+        })
+        notification.onclick = () => showWindow()
+        notification.onclose = () => {
+          if (activeNotification === notification) activeNotification = undefined
+        }
+      } catch (error) {
+        console.warn(`[mg-dsh-desktop] task notification failed:`, error)
+      }
+    },
     dispose: () => {
       if (!exited) exit()
     },

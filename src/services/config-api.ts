@@ -50,6 +50,10 @@ export interface ShellConfig {
   minimizeToTray: boolean
   /** Closing the window keeps the process + tray alive instead of quitting. */
   closeToTray: boolean
+  /** Show a Windows toast when a top-level user task completes. */
+  notifyOnTaskComplete: boolean
+  /** Active web-UI skin id ('default' = native look). */
+  skin: string
 }
 
 /** Defaults (mirror the plugin Config composition values). */
@@ -60,6 +64,8 @@ export const DEFAULT_SHELL_CONFIG: ShellConfig = {
   theme: 'system',
   minimizeToTray: true,
   closeToTray: false,
+  notifyOnTaskComplete: true,
+  skin: 'default',
 }
 
 /** Config document path under the harness home. */
@@ -106,6 +112,20 @@ export function writeShellConfig(patch: Partial<ShellConfig>): ShellConfig {
     // Persisting must not crash the request.
   }
   return next
+}
+
+/**
+ * The persisted notify flag only — `undefined` when the user never saved it,
+ * so callers can fall back to the composition Config value instead of the
+ * DEFAULT_SHELL_CONFIG default.
+ */
+export function storedNotifyOnTaskComplete(): boolean | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(configFile(), 'utf8')) as Partial<ShellConfig>
+    return typeof raw.notifyOnTaskComplete === 'boolean' ? raw.notifyOnTaskComplete : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** Write one JSON response. */
@@ -179,6 +199,10 @@ export function makeConfigRoutes(onChange?: (value: ShellConfig, changed?: { siz
               if (record.theme === 'system' || record.theme === 'light' || record.theme === 'dark') patch.theme = record.theme
               if (typeof record.minimizeToTray === 'boolean') patch.minimizeToTray = record.minimizeToTray
               if (typeof record.closeToTray === 'boolean') patch.closeToTray = record.closeToTray
+              if (typeof record.notifyOnTaskComplete === 'boolean') patch.notifyOnTaskComplete = record.notifyOnTaskComplete
+              // Skin id is an opaque short string; the client validates against
+              // its own registry and falls back to 'default' for unknown ids.
+              if (typeof record.skin === 'string' && record.skin.length > 0 && record.skin.length <= 64) patch.skin = record.skin
 
               const value = writeShellConfig(patch)
               onChange?.(value, { size: sizeChanged })
