@@ -1,5 +1,5 @@
 /**
- * mg-dsh-desktop settings card — one card in the dsh settings → plugins
+ * dsh-hub settings card — one card in the dsh settings → plugins
  * page, styled after the official PluginCard (collapsible header, themed
  * controls, save/discard footer). It edits the shell config (window size,
  * theme, tray behavior) through this plugin's own HTTP routes, and shows the
@@ -7,14 +7,15 @@
  *
  * The card renders only while the host serves the config API, which happens
  * only when the process was launched by this project (desktop shortcut /
- * `mg-dsh`); a plain command-line `dsh web` never mounts the bundle at all.
+ * `dsh-hub`); a plain command-line `dsh web` never mounts the bundle at all.
  */
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import clsx from 'clsx'
-import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconChevronDownOutline14, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
 import { CARD_CSS_CLASSES as c } from './style.ts'
-import { SKINS, DEFAULT_SKIN_ID, applySkin } from './skins.ts'
+import { SKINS, DEFAULT_SKIN_ID, applySkin, markSkinUserPicked } from './skins.ts'
+import { BACKGROUNDS, DEFAULT_BACKGROUND_ID, applyBackground, markBackgroundUserPicked } from './backgrounds.ts'
 
 /** Owner share of a plugin card (the section supplies nothing). */
 export interface DesktopSettingsCardProps {
@@ -31,12 +32,15 @@ interface ShellConfig {
   minimizeToTray: boolean
   closeToTray: boolean
   notifyOnTaskComplete: boolean
+  soundEnabled: boolean
+  allowMultipleInstances: boolean
   skin: string
+  background: string
 }
 
 /** Localized copy kept inline (the card is small; no locale plugin needed). */
 const COPY = {
-  title: 'MG DSH 设置',
+  title: 'DSH HUB 设置',
   description: '桌面壳配置：窗口尺寸、主题与托盘行为',
   unsaved: '未保存',
   readOnly: '当前文档只读，无法保存',
@@ -52,11 +56,26 @@ const COPY = {
   closeHint: '点 X 关闭窗口时保持进程与托盘存活（不勾选则完全退出）',
   notifyLabel: '会话完成通知',
   notifyHint: '任务回合完成时弹出系统通知，点击回到窗口',
+  soundLabel: '提示音',
+  soundHint: '用户提问、任务完成、AI 请求批准或任务出错时播放提示音（与系统通知互相独立）',
+  multiInstanceLabel: '允许同时运行多个 dsh 实例',
+  multiInstanceDanger:
+    '⚠ 危险：多个 dsh 实例共享同一份会话数据（$DSH_HOME），' +
+    '若同时在同一个会话中操作，会导致会话日志损坏（seq 冲突），' +
+    '可能丢失对话内容且需要手工修复。强烈不建议开启。',
+  multiInstanceHint: '不勾选时，若检测到已有 dsh 在运行，桌面壳将拒绝启动以保护数据',
   skinSection: '界面皮肤',
+  skinLabel: '界面皮肤',
   skinHint: '点击即应用并保存；「默认」恢复原生外观。深色模式下的皮肤跟随 dsh 主题设置',
   skinDefaultName: '默认',
   skinDefaultDesc: '官方原生外观',
   skinApplyFailed: '皮肤切换失败，请重试',
+  backgroundSection: '背景图',
+  backgroundLabel: '背景图',
+  backgroundHint: '点击即应用并保存；「无」关闭背景图，恢复原生/皮肤背景',
+  backgroundDefaultName: '无',
+  backgroundDefaultDesc: '不显示背景图',
+  backgroundApplyFailed: '背景切换失败，请重试',
   discard: '放弃',
   save: '保存',
   saving: '保存中…',
@@ -67,7 +86,7 @@ const COPY = {
 /** Read one shell config document (GET), or null on failure. */
 async function fetchConfig(): Promise<ShellConfig | null> {
   try {
-    const res = await fetch('/api/mg-dsh-desktop/config')
+    const res = await fetch('/api/dsh-hub/config')
     if (!res.ok) return null
     const body = (await res.json()) as { ok?: boolean; value?: ShellConfig }
     return body.ok === true && body.value !== undefined ? body.value : null
@@ -79,7 +98,7 @@ async function fetchConfig(): Promise<ShellConfig | null> {
 /** Write the shell config document (POST); returns the persisted value. */
 async function saveConfig(patch: Partial<ShellConfig>): Promise<ShellConfig | null> {
   try {
-    const res = await fetch('/api/mg-dsh-desktop/config', {
+    const res = await fetch('/api/dsh-hub/config', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(patch),
@@ -102,6 +121,14 @@ export function DesktopSettingsCard(_props: DesktopSettingsCardProps): ReactNode
   const [saved, setSaved] = useState(false)
   const [skinId, setSkinId] = useState<string>(DEFAULT_SKIN_ID)
   const [skinFailed, setSkinFailed] = useState(false)
+  const [skinMenuOpen, setSkinMenuOpen] = useState(false)
+  const [backgroundId, setBackgroundId] = useState<string>(DEFAULT_BACKGROUND_ID)
+  const [backgroundFailed, setBackgroundFailed] = useState(false)
+  const [backgroundMenuOpen, setBackgroundMenuOpen] = useState(false)
+  // B7: monotonic request sequence — only the LATEST config write's response
+  // may commit state; a slow older response must not clobber a newer one
+  // (overlapping onSave + skin pick, or two quick skin picks).
+  const saveSeq = useRef(0)
 
   // Load the config once on mount. The width/height fields seed from the
   // window's ACTUAL current size (the SPA viewport ≈ the native client area),
@@ -118,6 +145,7 @@ export function DesktopSettingsCard(_props: DesktopSettingsCardProps): ReactNode
       setConfig(initial)
       setDraft(initial)
       setSkinId(initial === null ? DEFAULT_SKIN_ID : initial.skin)
+      setBackgroundId(initial === null ? DEFAULT_BACKGROUND_ID : initial.background)
       setLoading(false)
     })
     return () => { alive = false }
@@ -129,7 +157,9 @@ export function DesktopSettingsCard(_props: DesktopSettingsCardProps): ReactNode
       || draft.theme !== config.theme
       || draft.minimizeToTray !== config.minimizeToTray
       || draft.closeToTray !== config.closeToTray
-      || draft.notifyOnTaskComplete !== config.notifyOnTaskComplete)
+      || draft.notifyOnTaskComplete !== config.notifyOnTaskComplete
+      || draft.soundEnabled !== config.soundEnabled
+      || draft.allowMultipleInstances !== config.allowMultipleInstances)
   const blocked = !dirty || saving || draft === null
 
   const patchDraft = (patch: Partial<ShellConfig>): void => {
@@ -150,15 +180,24 @@ export function DesktopSettingsCard(_props: DesktopSettingsCardProps): ReactNode
     if (draft.minimizeToTray !== config.minimizeToTray) patch.minimizeToTray = draft.minimizeToTray
     if (draft.closeToTray !== config.closeToTray) patch.closeToTray = draft.closeToTray
     if (draft.notifyOnTaskComplete !== config.notifyOnTaskComplete) patch.notifyOnTaskComplete = draft.notifyOnTaskComplete
+    if (draft.soundEnabled !== config.soundEnabled) patch.soundEnabled = draft.soundEnabled
+    if (draft.allowMultipleInstances !== config.allowMultipleInstances) patch.allowMultipleInstances = draft.allowMultipleInstances
     if (Object.keys(patch).length === 0) return
+    const seq = ++saveSeq.current
     setSaving(true)
     setFailed(false)
     setSaved(false)
     void saveConfig(patch).then((saved) => {
+      if (seq !== saveSeq.current) return // superseded by a newer write
       setSaving(false)
       if (saved !== null) {
         setConfig(saved)
-        setDraft(saved)
+        // Replay the submitted patch over the server response so the user's
+        // change is never silently reverted when the response omits a field
+        // (stale host build, whitelist miss, config write war). `config`
+        // keeps server truth, so a genuinely dropped field still shows as
+        // unsaved (dirty badge + enabled save button) instead of vanishing.
+        setDraft({ ...saved, ...patch })
         setSaved(true)
       } else {
         setFailed(true)
@@ -175,18 +214,52 @@ export function DesktopSettingsCard(_props: DesktopSettingsCardProps): ReactNode
   /** Apply a skin immediately: persist, then restyle the page live. */
   const onPickSkin = (id: string): void => {
     if (id === skinId) return
+    // A user pick must never be clobbered by the boot skin restore (B8).
+    markSkinUserPicked()
     setSkinFailed(false)
     setSkinId(id)
     applySkin(id)
+    const seq = ++saveSeq.current
     void saveConfig({ skin: id }).then((value) => {
+      // Superseded by a newer pick/save — never roll back a newer pick (B7).
+      if (seq !== saveSeq.current) return
       if (value !== null) {
         setConfig((prev) => prev === null ? prev : { ...prev, skin: id })
         setDraft((prev) => prev === null ? prev : { ...prev, skin: id })
+        setSaving(false)
       } else {
         // Roll back the live style if the persistence failed.
         applySkin(DEFAULT_SKIN_ID)
         setSkinId(DEFAULT_SKIN_ID)
         setSkinFailed(true)
+        setSaving(false)
+      }
+    })
+  }
+
+  /** Apply a background immediately: persist, then restyle the page live. */
+  const onPickBackground = (id: string): void => {
+    if (id === backgroundId) return
+    // A user pick must never be clobbered by the boot background restore.
+    markBackgroundUserPicked()
+    setBackgroundFailed(false)
+    setBackgroundId(id)
+    applyBackground(id)
+    const seq = ++saveSeq.current
+    setSaving(true) // mirror onSave: only the latest write clears the flag
+    void saveConfig({ background: id }).then((value) => {
+      // Superseded by a newer pick/save — never roll back a newer pick (B7).
+      if (seq !== saveSeq.current) return
+      if (value !== null) {
+        setConfig((prev) => prev === null ? prev : { ...prev, background: id })
+        setDraft((prev) => prev === null ? prev : { ...prev, background: id })
+        setSaving(false)
+      } else {
+        // Roll back the live style if the persistence failed.
+        applyBackground(DEFAULT_BACKGROUND_ID)
+        setBackgroundId(DEFAULT_BACKGROUND_ID)
+        setBackgroundFailed(true)
+        setSaving(false)
       }
     })
   }
@@ -292,52 +365,116 @@ export function DesktopSettingsCard(_props: DesktopSettingsCardProps): ReactNode
                         <span>{COPY.notifyLabel}</span>
                       </label>
                       <div className={c.hint}>{COPY.notifyHint}</div>
+                      <label className={c.checkboxRow}>
+                        <input
+                          type="checkbox"
+                          checked={draft.soundEnabled}
+                          onChange={(event) => patchDraft({ soundEnabled: event.target.checked })}
+                        />
+                        <span>{COPY.soundLabel}</span>
+                      </label>
+                      <div className={c.hint}>{COPY.soundHint}</div>
+                      <label className={c.checkboxRow}>
+                        <input
+                          type="checkbox"
+                          checked={draft.allowMultipleInstances}
+                          onChange={(event) => patchDraft({ allowMultipleInstances: event.target.checked })}
+                        />
+                        <span>{COPY.multiInstanceLabel}</span>
+                      </label>
+                      {draft.allowMultipleInstances
+                        ? <div className={c.dangerHint} role="alert">{COPY.multiInstanceDanger}</div>
+                        : <div className={c.hint}>{COPY.multiInstanceHint}</div>}
                     </div>
                   )}
-                  {/* Skin picker */}
+                  {/* Skin picker — official Setting-Cell row: label left, menu pill right, live description below. */}
                   {draft !== null && (
                     <div className={c.section}>
                       <div className={c.sectionTitle}>{COPY.skinSection}</div>
-                      <div className={c.hint}>{COPY.skinHint}</div>
-                      <div style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
-                        gap: 8,
-                        marginTop: 8,
-                      }}>
-                        <button
-                          type="button"
-                          className={c.select}
-                          aria-pressed={skinId === DEFAULT_SKIN_ID}
-                          onClick={() => onPickSkin(DEFAULT_SKIN_ID)}
-                          style={{
-                            textAlign: 'left',
-                            padding: '8px 10px',
-                            border: skinId === DEFAULT_SKIN_ID ? '2px solid var(--dsw-alias-brand-primary, #4a90d9)' : undefined,
+                      <div className={c.fieldRow}>
+                        <span className={c.fieldLabel}>{COPY.skinLabel}</span>
+                        <Menu
+                          open={skinMenuOpen}
+                          onClose={() => { setSkinMenuOpen(false) }}
+                          items={[
+                            { id: DEFAULT_SKIN_ID, label: COPY.skinDefaultName },
+                            ...SKINS.map((skin) => ({ id: skin.id, label: skin.name })),
+                          ]}
+                          selectedId={skinId}
+                          onSelect={(id) => {
+                            onPickSkin(id)
+                            setSkinMenuOpen(false)
                           }}
-                        >
-                          <strong>{COPY.skinDefaultName}</strong>
-                          <div style={{ fontSize: 11, opacity: 0.7 }}>{COPY.skinDefaultDesc}</div>
-                        </button>
-                        {SKINS.map((skin) => (
-                          <button
-                            key={skin.id}
-                            type="button"
-                            className={c.select}
-                            aria-pressed={skinId === skin.id}
-                            onClick={() => onPickSkin(skin.id)}
-                            style={{
-                              textAlign: 'left',
-                              padding: '8px 10px',
-                              border: skinId === skin.id ? '2px solid var(--dsw-alias-brand-primary, #4a90d9)' : undefined,
-                            }}
-                          >
-                            <strong>{skin.name}</strong>
-                            <div style={{ fontSize: 11, opacity: 0.7 }}>{skin.description}</div>
-                          </button>
-                        ))}
+                          align="end"
+                          portal
+                          anchor={(
+                            <button
+                              type="button"
+                              className={c.selectPill}
+                              aria-haspopup="menu"
+                              aria-expanded={skinMenuOpen}
+                              onClick={() => { setSkinMenuOpen(v => !v) }}
+                            >
+                              {skinId === DEFAULT_SKIN_ID
+                                ? COPY.skinDefaultName
+                                : (SKINS.find((skin) => skin.id === skinId)?.name ?? skinId)}
+                              <IconChevronDownOutline14 />
+                            </button>
+                          )}
+                        />
+                      </div>
+                      <div className={c.hint}>
+                        {skinId === DEFAULT_SKIN_ID
+                          ? COPY.skinDefaultDesc
+                          : (SKINS.find((skin) => skin.id === skinId)?.description ?? '')}
+                        {' — '}{COPY.skinHint}
                       </div>
                       {skinFailed ? <p className={c.failed} role="status">{COPY.skinApplyFailed}</p> : null}
+                    </div>
+                  )}
+                  {/* Background picker — official Setting-Cell row like the skin picker. */}
+                  {draft !== null && (
+                    <div className={c.section}>
+                      <div className={c.sectionTitle}>{COPY.backgroundSection}</div>
+                      <div className={c.fieldRow}>
+                        <span className={c.fieldLabel}>{COPY.backgroundLabel}</span>
+                        <Menu
+                          open={backgroundMenuOpen}
+                          onClose={() => { setBackgroundMenuOpen(false) }}
+                          items={[
+                            { id: DEFAULT_BACKGROUND_ID, label: COPY.backgroundDefaultName },
+                            ...BACKGROUNDS.map((background) => ({ id: background.id, label: background.name })),
+                          ]}
+                          selectedId={backgroundId}
+                          onSelect={(id) => {
+                            onPickBackground(id)
+                            setBackgroundMenuOpen(false)
+                          }}
+                          align="end"
+                          portal
+                          anchor={(
+                            <button
+                              type="button"
+                              className={c.selectPill}
+                              aria-haspopup="menu"
+                              aria-expanded={backgroundMenuOpen}
+                              onClick={() => { setBackgroundMenuOpen(v => !v) }}
+                            >
+                              {backgroundId === DEFAULT_BACKGROUND_ID
+                                ? COPY.backgroundDefaultName
+                                : (BACKGROUNDS.find((background) => background.id === backgroundId)?.name ?? backgroundId)}
+                              <IconChevronDownOutline14 />
+                            </button>
+                          )}
+                        />
+                      </div>
+                      <div className={c.hint}>
+                        {backgroundId === DEFAULT_BACKGROUND_ID
+                          ? COPY.backgroundDefaultDesc
+                          : (BACKGROUNDS.find((background) => background.id === backgroundId)?.description ?? '')}
+                        {' — '}{COPY.backgroundHint}
+                      </div>
+                      {backgroundFailed ? <p className={c.failed} role="status">{COPY.backgroundApplyFailed}</p> : null}
                     </div>
                   )}
                 </>

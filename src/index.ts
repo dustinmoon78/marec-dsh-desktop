@@ -1,16 +1,16 @@
 /**
- * mg-dsh-desktop host half — the desktop shell over the web-app layer.
+ * dsh-hub host half — the desktop shell over the web-app layer.
  *
  * Launch gating: the desktop window, the config API, and the settings
  * namespace are active ONLY when the process was started by this project —
- * the desktop shortcut or the `mg-dsh` command, both of which set
- * `MG_DSH_DESKTOP_LAUNCHED=1`. The cordis.patch.yml row is additionally
+ * the desktop shortcut or the `dsh-hub` command, both of which set
+ * `DSH_HUB_LAUNCHED=1`. The cordis.patch.yml row is additionally
  * `disabled` under any other launch, so a plain command-line `dsh web` never
  * even mounts this plugin: no window, no client row in __DSH_BOOT__, nothing
  * injected.
  *
  * Config surface: the client settings card reads/writes the shell config
- * through this plugin's own HTTP routes (`/api/mg-dsh-desktop/config`).
+ * through this plugin's own HTTP routes (`/api/dsh-hub/config`).
  * This is deliberate — dsh's RPC `settings.describe` exposes only a
  * hard-coded allowlist in the api-proxy (third-party plugin namespaces are
  * "deferred work" per its source comment), so the supported pattern for
@@ -19,7 +19,7 @@
  * via the official `installSettingsSection` for in-process consumers and for
  * the day the allowlist opens up.
  *
- * @module mg-dsh-desktop
+ * @module dsh-hub
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -36,15 +36,16 @@ import type {} from '@deepseek-ai/dsh-agent'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { openDesktopShell, type DesktopShellHandle } from './desktop.ts'
-import { makeConfigRoutes, migrateLegacyPaths, readShellConfig, storedNotifyOnTaskComplete, type ShellConfig } from './services/config-api.js'
-import { makePinsRoutes } from './services/pins-api.js'
+import { makeConfigRoutes, hasStoredWindowSize, migrateLegacyPaths, readShellConfig, storedNotifyOnTaskComplete, storedSoundEnabled, type ShellConfig } from './services/config-api.js'
 import { setAppUserModelId } from './services/app-id.js'
 import { dshHome } from './services/state-store.js'
 import { openFolderInExplorer } from './services/explorer.js'
 import { makeWorkspaceRoutes } from './services/workspace-api.js'
+import { makePinsRoutes } from './services/pins-api.js'
+import { makeBackgroundsRoutes } from './services/backgrounds-api.js'
 
 /** Stable Cordis plugin name (referenced by cordis.patch.yml's insert row). */
-export const name = 'mg-dsh-desktop'
+export const name = '@marecgents/dsh-hub'
 
 /**
  * Optional services are read via `ctx.get`, never injected: declaring
@@ -73,37 +74,48 @@ export interface Config {
    * toast restores the main window. Defaults to on.
    */
   notifyOnTaskComplete: boolean
+  /**
+   * Play the shell's event sounds (question submitted / task complete / AI
+   * approval / task error). Independent of `notifyOnTaskComplete`. Defaults
+   * to on.
+   */
+  soundEnabled: boolean
 }
 
 export const Config: z<Config> = z.object({
-  title: z.string().required(),
-  width: z.number().required(),
-  height: z.number().required(),
+  // Defaults make the plugin hot-loadable without an explicit patch config;
+  // the shipped cordis.patch.yml still overrides these when installed normally.
+  // Contract: schema defaults must stay equal to the patch config values so
+  // hot-loaded and normally-installed runs behave identically.
+  title: z.string().default('DeepSeek Harness Hub'),
+  width: z.number().default(1280),
+  height: z.number().default(720),
   minimizeToTray: z.boolean().default(true),
   closeToTray: z.boolean().default(false),
   theme: z.union([z.const('system'), z.const('light'), z.const('dark')]).default('system'),
   notifyOnTaskComplete: z.boolean().default(true),
+  soundEnabled: z.boolean().default(true),
 })
 
 /** Settings namespace owned by this plugin (spelled like the package). */
-export const SETTINGS_NS = settingsNamespace('mg-dsh-desktop')
+export const SETTINGS_NS = settingsNamespace('dsh-hub')
 
-/** Env marker the desktop shortcut / `mg-dsh` command sets before spawning dsh web. */
-export const LAUNCHED_BY_SHORTCUT_ENV = 'MG_DSH_DESKTOP_LAUNCHED'
+/** Env marker the desktop shortcut / `dsh-hub` command sets before spawning dsh web. */
+export const LAUNCHED_BY_SHORTCUT_ENV = 'DSH_HUB_LAUNCHED'
 
 /** Loader entry name of the web server row (web-app bundle's patch). */
 const WEB_SERVER_ENTRY = '@deepseek-ai/dsh-host-webserver'
 /** FiberState.Active — keep the numeric value so no cordis enum import is needed. */
 const FIBER_ACTIVE = 2
 
-/** True when this process was started by the desktop shortcut or `mg-dsh`. */
+/** True when this process was started by the desktop shortcut or `dsh-hub`. */
 export function launchedByShortcut(): boolean {
   return process.env[LAUNCHED_BY_SHORTCUT_ENV] === '1'
 }
 
 /** Marker the launcher checks so an intentional tray quit is never auto-restarted. */
 function quitMarkerFile(): string {
-  return join(dshHome(), 'mg-dsh-desktop', 'quit.marker')
+  return join(dshHome(), 'dsh-hub', 'quit.marker')
 }
 
 /**
@@ -138,19 +150,19 @@ async function openWorkspaceDir(
   getCurrentPath: (cb: (path: string | null) => void) => void,
 ): Promise<void> {
   const startedAt = Date.now()
-  console.log(`[mg-dsh-desktop] open workspace start at ${startedAt}`)
+  console.log(`[dsh-hub] open workspace start at ${startedAt}`)
   try {
     getCurrentPath((path) => {
       const cwd = path ?? activeCwd ?? process.cwd()
       try {
         openFolderInExplorer(cwd)
-        console.log(`[mg-dsh-desktop] explorer launched in ${Date.now() - startedAt}ms (${cwd})`)
+        console.log(`[dsh-hub] explorer launched in ${Date.now() - startedAt}ms (${cwd})`)
       } catch (error) {
-        console.warn(`[mg-dsh-desktop] open workspace failed in ${Date.now() - startedAt}ms:`, error)
+        console.warn(`[dsh-hub] open workspace failed in ${Date.now() - startedAt}ms:`, error)
       }
     })
   } catch (error) {
-    console.warn(`[mg-dsh-desktop] open workspace failed in ${Date.now() - startedAt}ms:`, error)
+    console.warn(`[dsh-hub] open workspace failed in ${Date.now() - startedAt}ms:`, error)
   }
 }
 
@@ -170,17 +182,19 @@ function newTaskInWeb(_ctx: Context, dispatch: (name: string, detail?: Record<st
 
 /**
  * Merge the persisted shell config over the composition entry (persisted
- * wins). Startup width/height intentionally stay `undefined`: the desktop
- * shell always opens non-maximized at 3/4 of the launch screen. The plugin
- * page's saved resolution only applies immediately while the window is not
- * maximized (see DesktopShellHandle.applySize).
+ * wins). Startup width/height come from the persisted document ONLY when the
+ * user explicitly saved them (hasStoredWindowSize) — otherwise `undefined`
+ * lets the desktop shell size the default window to 3/4 of the launch
+ * screen. (A4: previously the saved size was never applied on boot, and the
+ * old writeShellConfig seeded default width/height into the file.)
  */
 function effectiveConfig(config: Config): Config {
   const stored = readShellConfig()
+  const hasSize = hasStoredWindowSize()
   return {
     ...config,
-    width: undefined as unknown as number,
-    height: undefined as unknown as number,
+    width: hasSize ? stored.width : (undefined as unknown as number),
+    height: hasSize ? stored.height : (undefined as unknown as number),
     theme: stored.theme ?? config.theme,
     minimizeToTray: stored.minimizeToTray ?? config.minimizeToTray,
     closeToTray: stored.closeToTray ?? config.closeToTray,
@@ -193,10 +207,10 @@ export function apply(ctx: Context, config: Config): void {
 
   const launched = launchedByShortcut()
   if (!launched) {
-    console.log('[mg-dsh-desktop] not launched by the desktop shortcut; shell + plugin page disabled (CLI mode)')
+    console.log('[dsh-hub] not launched by the desktop shortcut; shell + plugin page disabled (CLI mode)')
     return
   }
-  console.log('[mg-dsh-desktop] launched by shortcut; desktop shell + plugin page active')
+  console.log('[dsh-hub] launched by shortcut; desktop shell + plugin page active')
 
   // Windows taskbar identity: without an explicit AppUserModelID the window
   // is attributed to node.exe (green-hexagon icon, "Node.js JavaScript
@@ -218,23 +232,43 @@ export function apply(ctx: Context, config: Config): void {
   // session/event fires for every session activity and carries the Session as
   // its first argument, so it reliably reflects the session the user is
   // looking at — unlike agent/created, which only fires when a session runs.
-  ctx.on('session/event', (session: { header?: { cwd?: string; delegationDepth?: number } }, event: unknown) => {
+  ctx.on('session/event', (session: { id?: string; header?: { cwd?: string; delegationDepth?: number } }, event: unknown) => {
     const cwd = session.header?.cwd
     if (cwd !== undefined) activeCwd = cwd
+    const depth = session.header?.delegationDepth ?? 0
+    // Event sounds: question submitted (turn/start), AI approval requested
+    // (approval/asked), task complete (turn/end → completed), task error
+    // (turn/end → error). Only depth-0 user sessions; subagent turns are
+    // invisible busy work and stay silent. A value saved in the settings
+    // card (persisted) wins over the composition Config and applies live.
+    const soundEnabled = storedSoundEnabled() ?? config.soundEnabled
+    if (soundEnabled && depth === 0) {
+      const e = event as { type?: string; data?: { reason?: { kind?: string } } } | undefined
+      if (e?.type === 'turn/start') {
+        shell?.playSound('start')
+      } else if (e?.type === 'approval/asked') {
+        shell?.playSound('attention')
+      } else if (e?.type === 'turn/end') {
+        const kind = e.data?.reason?.kind
+        if (kind === 'completed') shell?.playSound('success')
+        else if (kind === 'error') shell?.playSound('error')
+      }
+    }
     // Task-complete notification: fire for top-level user sessions only
     // (depth 0 — subagent turns are invisible busy work), and only when a
-    // turn actually finished with reason `completed`. A value saved in the
-    // settings card (persisted) wins over the composition Config and applies
-    // live without a restart.
+    // turn actually finished (`completed` or `error`). The desktop shell
+    // suppresses the toast when the finished session is the one the user is
+    // currently looking at (the sound alone already announced it).
     const notifyEnabled = storedNotifyOnTaskComplete() ?? config.notifyOnTaskComplete
     if (!notifyEnabled) return
-    if ((session.header?.delegationDepth ?? 0) !== 0) return
+    if (depth !== 0) return
     const e = event as { type?: string; data?: { reason?: { kind?: string } } } | undefined
-    if (e?.type !== 'turn/end' || e.data?.reason?.kind !== 'completed') return
-    try {
-      shell?.notifyTaskComplete('任务完成，点击回到窗口')
-    } catch {
-      // Best-effort; a failed toast must never break the session loop.
+    if (e?.type !== 'turn/end') return
+    const kind = e.data?.reason?.kind
+    if (kind === 'completed') {
+      shell?.notifyTaskComplete('任务完成，点击回到窗口', { sessionId: session.id })
+    } else if (kind === 'error') {
+      shell?.notifyTaskComplete('任务出错，点击回到窗口', { sessionId: session.id })
     }
   })
   ctx.on('agent/created', (payload: { agent: unknown }) => {
@@ -261,6 +295,7 @@ export function apply(ctx: Context, config: Config): void {
       }),
       ...makeWorkspaceRoutes(),
       ...makePinsRoutes(),
+      ...makeBackgroundsRoutes(),
     ].map((route) => server.register(route))
     routesDisposed = () => {
       for (const dispose of disposers) void dispose()
@@ -272,7 +307,7 @@ export function apply(ctx: Context, config: Config): void {
     if (opened) return
     const server = ctx.get('webServer')
     if (server === undefined) {
-      console.log('[mg-dsh-desktop] no web server in this profile; desktop shell skipped')
+      console.log('[dsh-hub] no web server in this profile; desktop shell skipped')
       return
     }
     registerRoutes()
@@ -301,9 +336,9 @@ export function apply(ctx: Context, config: Config): void {
           return { minimizeToTray: stored.minimizeToTray, closeToTray: stored.closeToTray }
         },
       }, () => exitProcess(ctx))
-      console.log(`[mg-dsh-desktop] desktop shell opened on http://127.0.0.1:${server.port}`)
+      console.log(`[dsh-hub] desktop shell opened on http://127.0.0.1:${server.port}`)
     } catch (error) {
-      console.error('[mg-dsh-desktop] failed to open desktop shell:', error)
+      console.error('[dsh-hub] failed to open desktop shell:', error)
     }
   }
 

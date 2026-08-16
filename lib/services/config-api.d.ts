@@ -1,5 +1,5 @@
 /**
- * mg-dsh-desktop config API — same-origin JSON endpoints the client
+ * dsh-hub config API — same-origin JSON endpoints the client
  * settings card uses to read and write the shell configuration (window size
  * policy, theme, tray). Deliberately NOT a settings namespace: dsh's RPC
  * settings.describe exposes only a hard-coded allowlist (third-party plugin
@@ -9,13 +9,13 @@
  */
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver';
 /**
- * One-time migration from the pre-release `marec-dsh-desktop` names (the
- * package was renamed before its first npm publish). Best-effort; called at
- * plugin apply so existing installs keep their window settings.
+ * One-time migration from the pre-release names (`marec-dsh-desktop` and
+ * `mg-dsh-desktop`) to the current `dsh-hub` home directory. Best-effort;
+ * called at plugin apply so existing installs keep their window settings.
  */
 export declare function migrateLegacyPaths(): void;
 /** Browser-facing base path of the shell config API. */
-export declare const CONFIG_API_PREFIX = "/api/mg-dsh-desktop";
+export declare const CONFIG_API_PREFIX = "/api/dsh-hub";
 /** Runtime shell config persisted under the harness home. */
 export interface ShellConfig {
     /** Window open policy: 'auto' (always when launched here) | 'manual'. */
@@ -32,8 +32,22 @@ export interface ShellConfig {
     closeToTray: boolean;
     /** Show a Windows toast when a top-level user task completes. */
     notifyOnTaskComplete: boolean;
+    /**
+     * Play the shell's event sounds (question submitted / task complete / AI
+     * approval / task error). Independent of `notifyOnTaskComplete`: sounds
+     * are the always-on channel, toasts are the focused-window-aware one.
+     */
+    soundEnabled: boolean;
+    /**
+     * Allow launching this desktop shell while another dsh instance is already
+     * running (they share $DSH_HOME; writing the same session from both ends
+     * can corrupt it). Default false = strictly refuse to coexist.
+     */
+    allowMultipleInstances: boolean;
     /** Active web-UI skin id ('default' = native look). */
     skin: string;
+    /** Active background image id ('none' = no image, native background). */
+    background: string;
 }
 /** Defaults (mirror the plugin Config composition values). */
 export declare const DEFAULT_SHELL_CONFIG: ShellConfig;
@@ -45,9 +59,20 @@ export declare function readShellConfig(): ShellConfig;
  * True when the persisted config explicitly stores a window size. A user who
  * saved the settings card's width/height gets that exact size on launch;
  * otherwise the shell sizes the default window to the launch screen.
+ * Exactly-default pairs (1280×720) are ignored: old writeShellConfig builds
+ * merged over DEFAULT_SHELL_CONFIG, so any save (e.g. a checkbox toggle)
+ * wrote the default size into the file — that was never the user's explicit
+ * choice, and honoring it would pin the window to 1280×720 forever (A4).
  */
 export declare function hasStoredWindowSize(): boolean;
-/** Persist the config (best-effort, atomic write). */
+/**
+ * Persist the config (best-effort, atomic write). Merges over the RAW stored
+ * document — never over DEFAULT_SHELL_CONFIG — so a partial save (e.g. skin
+ * only) cannot seed default width/height into the file, which would flip
+ * hasStoredWindowSize() and pin the window to the defaults (A4).
+ * @param patch - the narrowed fields from the POST body.
+ * @returns the full effective config (defaults merged) for the response.
+ */
 export declare function writeShellConfig(patch: Partial<ShellConfig>): ShellConfig;
 /**
  * The persisted notify flag only — `undefined` when the user never saved it,
@@ -55,6 +80,11 @@ export declare function writeShellConfig(patch: Partial<ShellConfig>): ShellConf
  * DEFAULT_SHELL_CONFIG default.
  */
 export declare function storedNotifyOnTaskComplete(): boolean | undefined;
+/**
+ * The persisted sound flag only — `undefined` when the user never saved it,
+ * so callers can fall back to the composition Config value.
+ */
+export declare function storedSoundEnabled(): boolean | undefined;
 /**
  * Build the shell config route (one exact route; GET reads, POST updates).
  * @param onChange - invoked with the persisted config after each successful

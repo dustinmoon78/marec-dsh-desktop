@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * tray-helper.mjs — standalone system-tray owner for mg-dsh-desktop.
+ * tray-helper.mjs — standalone system-tray owner for dsh-hub.
  *
  * It runs in its own Node process/event loop so tray menu clicks are NOT
  * queued behind the WebView2 window's event loop. Commands are sent back to
@@ -93,3 +93,8 @@ rl.on('line', (line) => {
 
 process.on('SIGTERM', () => process.exit(0))
 process.on('SIGINT', () => process.exit(0))
+// The parent (launcher) owns this helper's lifecycle; when it dies or closes
+// the pipe, stdin ends and this process must follow — a stdin 'close' with no
+// exit message means the parent is gone, and lingering would leave an orphan
+// tray that fights the next launch for the icon slot.
+rl.on('close', () => process.exit(0))

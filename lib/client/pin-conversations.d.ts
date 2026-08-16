@@ -1,30 +1,33 @@
 /**
  * Pinned conversations (置顶会话) — the browser half of the conversation
- * pinning feature.
+ * pinning feature, reimplemented on rc.10 (see docs/PR4-置顶会话重构方案).
  *
  * The official session list (ui-workspace's WorkspaceBrowser inside the
  * `sidebar.workspaces` single slot) has no plugin seat for per-session
- * actions, so this module augments the rendered list directly:
+ * actions, so this module augments the rendered list with **stable anchors
+ * only** — no CSS-module hashes:
  *
- *  - a pin toggle button is added to each session row's action area;
- *  - pinned sessions appear in a "置顶" section pinned to the top of the
- *    session tree (an extra first child of the `role="tree"` list — React
- *    tolerates foreign siblings, and a MutationObserver re-creates the
- *    section whenever the list is re-rendered);
- *  - the pinned set persists through the host pins API
- *    (`/api/mg-dsh-desktop/pins`, backed by pins.json), falling back to
- *    localStorage when the API is unreachable.
+ *  - anchors: `div[data-slot="sidebar.workspaces"]` (slot renderer seam),
+ *    `role="tree"`, `div[role="treeitem"]` (session rows; project rows carry
+ *    `aria-expanded`, search-result rows are `<button>` and are excluded);
+ *  - row → session mapping is **content-based**: a row is the session whose
+ *    `displayTitle` text appears inside it. Duplicate titles → the whole
+ *    title group is skipped (never mislabeled). Renamed sessions simply stop
+ *    matching until the row re-renders with the new title — the pin itself
+ *    survives (pins are keyed by session id);
+ *  - the pinned section is injected as a **sibling of `role="tree"`** inside
+ *    the slot container (`role="group" aria-label="置顶会话"`), so the tree's
+ *    aria structure is untouched; an independent scroll block (40vh);
+ *  - persistence: host GET/PUT `/api/dsh-hub/pins` (`pins.json`), with a
+ *    localStorage fallback when the API is unreachable.
  *
- * Row → session-id mapping is title-based: the DOM rows carry no id, but each
- * row's title text equals the runtime's `displayTitle` (durable title →
- * project basename → session id), which is unique in practice. Rows whose
- * title is absent or ambiguous are silently skipped — the feature degrades
- * per-row instead of ever mislabeling.
+ * Correctness state machine (report §2.6): write paths are gated on a landed
+ * `ready` baseline so an empty mid-boot session list can never wipe pins;
+ * boot results merge with the user's in-flight delta (`dirtyDelta`), and
+ * pruning only removes pins after two consecutive ready snapshots miss the id
+ * (or an explicit unpin).
  *
- * All writes are idempotent diffs (nothing is rewritten when already
- * present), so the MutationObserver converges after one pass.
- *
- * @module mg-dsh-desktop/client/pin-conversations
+ * @module dsh-hub/client/pin-conversations
  */
 /** Pinned-conversations controller; install() returns the disposer. */
 export declare function installPinnedConversations(ctx: unknown): () => void;

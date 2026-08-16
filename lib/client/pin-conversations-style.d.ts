@@ -1,18 +1,20 @@
 /**
- * Pinned-conversations styles — injected as a string (same rationale as the
- * card / right-sidebar stylesheets: tsdown extracts .css files the dsh client
- * loader never fetches). Uses the official `--dsw-alias-*` design tokens so
- * the pinned section and row buttons follow the active theme.
+ * Pinned-conversations styles — a fixed-classname stylesheet injected into the
+ * page by {@link injectPinStyle}. Same engineering as the settings card and
+ * right sidebar: no CSS module (tsdown never fetches a sidecar), official
+ * `--dsw-alias-*` / `--dsw-specific-*` design tokens with literal fallbacks,
+ * and a stable `mg-pin-*` class prefix.
  *
- * The pinned section mirrors the official workspace group look
- * (ui-workspace/Rows.module.css + WorkspaceBrowser.module.css geometry):
- * 34px rows, 13px type, round 24px icon buttons. Official class names it must
- * reach into (`YDXeBa_sessionRow`, `YDXeBa_title`) are CSS-module hashes that
- * are stable for the dsh version this desktop app wraps; the row-marker style
- * (title tint) degrades gracefully to the marker row background if a hash
- * ever changes.
+ * Layout contract (see docs/PR4-置顶会话重构方案-2026-08-16.md §2.7):
+ *  - the pinned section is a flow sibling of the official `role="tree"` inside
+ *    the sidebar slot container: flex:none, an independent scroll block
+ *    (max-height 40vh), and a `.list`-matching box model so rows align;
+ *  - row pin buttons use a zero-width expand trick so they are keyboard
+ *    reachable (width:0 is focusable, display:none is not) and non-hover rows
+ *    keep zero layout shift; the pinned state stays visible;
+ *  - pinned-section items are sibling buttons (open + unpin), never nested.
  */
-/** Pin-feature class names shared by the module and the stylesheet. */
+/** Pin class names — the single source components and stylesheet share. */
 export declare const PIN_CSS_CLASSES: {
     readonly section: "mg-pin-section";
     readonly head: "mg-pin-head";
@@ -20,15 +22,14 @@ export declare const PIN_CSS_CLASSES: {
     readonly headCount: "mg-pin-head-count";
     readonly list: "mg-pin-list";
     readonly item: "mg-pin-item";
-    readonly itemIcon: "mg-pin-item-icon";
+    readonly itemOpen: "mg-pin-item-open";
     readonly itemTitle: "mg-pin-item-title";
+    readonly itemIcon: "mg-pin-item-icon";
     readonly itemUnpin: "mg-pin-item-unpin";
-    readonly itemSvg: "mg-pin-item-svg";
     readonly pinBtn: "mg-pin-btn";
     readonly pinBtnOn: "mg-pin-btn--on";
+    readonly rowPinned: "mg-pin-row-pinned";
     readonly pinSvg: "mg-pin-svg";
-    /** Marker class on a session row whose session is pinned (title tint). */
-    readonly rowPinned: "mg-pin-row";
 };
-/** Inject the pin stylesheet once (idempotent; no-op when already present). */
+/** Inject the pin stylesheet once (idempotent). */
 export declare function injectPinStyle(): void;

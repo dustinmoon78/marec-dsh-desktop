@@ -34,6 +34,7 @@ import { resolveLaunchScreen } from './services/screen.js'
 import { WebViewThemeDetector } from './services/theme-sync.js'
 import { WebViewTray, type TrayCommand } from './services/tray.js'
 import { dshFaviconBlack, dshFaviconDark, dshFaviconDataUrl, dshFaviconTray } from './services/icons.js'
+import { playTaskSound, type TaskSoundKind } from './services/sound.js'
 import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
@@ -92,11 +93,24 @@ export interface DesktopShellHandle {
    */
   dispatchEvent(name: string, detail?: Record<string, unknown>): void
   /**
+   * Play one shell event sound (question submitted / task complete / AI
+   * approval / task error). Best-effort: a failed chime never breaks the
+   * session loop.
+   */
+  playSound(kind: TaskSoundKind): void
+  /**
    * Show a native Windows notification (task-complete toast). Clicking it
    * restores the main window, so the user can jump straight back to the
    * finished conversation even when the window is hidden to the tray.
+   *
+   * Toast policy: suppressed only when the window is visible AND the
+   * completed session is the one the user is currently looking at
+   * (`opts.sessionId` matches the host's tracked focused session) — that
+   * case already announces itself in the UI, and the sound alone suffices.
+   * Hidden/minimized windows and background (non-focused) sessions still
+   * toast, subject to the spam cooldown.
    */
-  notifyTaskComplete(body: string): void
+  notifyTaskComplete(body: string, opts?: { sessionId?: string }): void
   /** Dispose the shell (tray, theme polling, event pump). */
   dispose(): void
 }
@@ -156,7 +170,7 @@ function applyWindowIcon(w: BrowserWindow, dark: boolean): void {
 /** Apply the title-bar theme; koffi fast path, PowerShell fallback. */
 function applyNativeTitleBarTheme(hwnd: bigint, dark: boolean): void {
   if (setTitleBarDark(hwnd, dark)) {
-    console.log(`[mg-dsh-desktop] dwm(${hwnd}, ${dark ? 'dark' : 'light'}) -> 0`)
+    console.log(`[dsh-hub] dwm(${hwnd}, ${dark ? 'dark' : 'light'}) -> 0`)
   } else {
     setTitleBarDarkPowerShell(hwnd, dark)
   }
@@ -206,7 +220,7 @@ export function openDesktopShell(
   // WebView2's default-context data directory fails with E_ACCESSDENIED on
   // some machines; use a dedicated per-app directory (kept app-scoped so
   // close-to-tray window recreation reuses the same context).
-  const shellDataDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'mg-dsh-desktop', 'browser-data')
+  const shellDataDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'dsh-hub', 'browser-data')
   fs.mkdirSync(shellDataDir, { recursive: true })
   const shellContext = app.createWebContext({ dataDirectory: shellDataDir })
   const darkByDefault = options.theme !== 'light'
@@ -222,6 +236,20 @@ export function openDesktopShell(
     }
   }
 
+  /** Startup/restore size: the persisted saved size when one is stored
+   * (options.width/height from effectiveConfig), else the 3/4 default. Used
+   * by both the initial window and the un-maximize restore, so a maximized
+   * session always returns to the user's saved size (A4).
+   *
+   * `logical` records the unit of the returned dimensions: saved sizes are
+   * logical (settings card / CSS pixels), the 3/4 default is physical
+   * (resolveLaunchScreen after the Application initializes DPI awareness). */
+  const restoreSize = (): { width: number; height: number; logical: boolean } => {
+    return options.width !== undefined && options.height !== undefined
+      ? { width: options.width, height: options.height, logical: true }
+      : { ...defaultSize(), logical: false }
+  }
+
   // ── Window factory (recreatable for close-to-tray) ────────────────────────
   let win: BrowserWindow | undefined
   let webview: JsWebview | undefined
@@ -231,8 +259,9 @@ export function openDesktopShell(
   let closedToTray = false
   let themeSetting: DesktopOptions['theme'] = options.theme
   let tray: WebViewTray | undefined
-  /** Custom size requested while maximized; consumed by the next un-maximize. */
-  let pendingCustomSize: { width: number; height: number } | undefined
+  /** Custom size requested while maximized; consumed by the next un-maximize.
+   * Always logical (settings card / CSS pixels), so `logical` is true. */
+  let pendingCustomSize: { width: number; height: number; logical: boolean } | undefined
   /** One pending "current workspace path" request callback at a time. */
   let pendingWorkspacePathCb: ((path: string | null) => void) | undefined
 
@@ -248,9 +277,9 @@ export function openDesktopShell(
     let hwnd: bigint | undefined
     try {
       hwnd = w.getNativeHandle()
-      console.log(`[mg-dsh-desktop] window hwnd: ${hwnd}`)
+      console.log(`[dsh-hub] window hwnd: ${hwnd}`)
     } catch (error) {
-      console.warn(`[mg-dsh-desktop] getNativeHandle failed: ${String(error)}`)
+      console.warn(`[dsh-hub] getNativeHandle failed: ${String(error)}`)
     }
     if (theme === 'system') {
       // dsh defaults dark; corrected by the first probe as soon as the SPA paints.
@@ -260,7 +289,7 @@ export function openDesktopShell(
       if (hwnd !== undefined) applyNativeTitleBarTheme(hwnd, true)
       detector = new WebViewThemeDetector(wv)
       detector.start((dark) => {
-        console.log(`[mg-dsh-desktop] page theme ${dark ? 'dark' : 'light'}`)
+        console.log(`[dsh-hub] page theme ${dark ? 'dark' : 'light'}`)
         w.setTheme(dark ? Theme.Dark : Theme.Light)
         wv.setBackgroundColor(...(dark ? DARK_BG : LIGHT_BG), 255)
         applyWindowIcon(w, dark)
@@ -285,22 +314,25 @@ export function openDesktopShell(
     detector?.stop()
     detector = undefined
 
-    // Startup/restore size is always 3/4 of the launch screen (the plugin
-    // page's width/height only applies immediately while not maximized).
-    const size = defaultSize()
+    // Startup/restore size: the saved size when the user stored one, else
+    // 3/4 of the launch screen (see restoreSize).
+    const size = restoreSize()
     const { width, height } = size
-    console.log(`[mg-dsh-desktop] default window ${width}x${height}`)
+    console.log(`[dsh-hub] window ${width}x${height}`)
 
     const w = app.createBrowserWindow({
       title: options.title,
       width,
       height,
+      // Saved sizes are logical; the 3/4 screen default is physical.
+      logical: size.logical,
       // A hidden window (close-to-tray keepalive) starts invisible so the
       // app survives the previous window's close without flashing.
       ...(opts?.hidden === true ? { visible: false } : {}),
     })
     win = w
-    w.setMinSize(MIN_WIDTH, MIN_HEIGHT)
+    // MIN_WIDTH/MIN_HEIGHT are logical (settings card minimums).
+    w.setMinSize(MIN_WIDTH, MIN_HEIGHT, true)
     w.center()
     if (state.maximized === true) w.setMaximized(true)
 
@@ -310,18 +342,29 @@ export function openDesktopShell(
     webview = wv
     wv.setBackgroundColor(...DARK_BG, 255)
 
-    // Central IPC handler: theme-sync and workspace-path requests share the
-    // single onIpcMessage slot so neither overwrites the other.
+    // Central IPC handler: theme-sync, workspace-path and session-focus
+    // requests share the single onIpcMessage slot so neither overwrites the
+    // other.
     wv.onIpcMessage((message) => {
       detector?.handleIpcMessage(message)
       try {
         const text = message.body.toString()
-        if (!text.startsWith('mg:workspace-path:')) return
-        const raw = text.slice('mg:workspace-path:'.length)
-        const path = raw === '' ? null : decodeURIComponent(raw)
-        const cb = pendingWorkspacePathCb
-        pendingWorkspacePathCb = undefined
-        cb?.(path)
+        if (text.startsWith('mg:workspace-path:')) {
+          const raw = text.slice('mg:workspace-path:'.length)
+          const path = raw === '' ? null : decodeURIComponent(raw)
+          const cb = pendingWorkspacePathCb
+          pendingWorkspacePathCb = undefined
+          cb?.(path)
+          return
+        }
+        // The browser half reports the focused session so the toast policy
+        // can distinguish "watching the finished session" (sound only) from
+        // "watching something else" (toast too).
+        if (text.startsWith('mg:session-focus:')) {
+          const raw = text.slice('mg:session-focus:'.length)
+          focusedSessionId = raw === '' ? undefined : decodeURIComponent(raw)
+          return
+        }
       } catch {
         // Ignore malformed IPC payloads.
       }
@@ -358,11 +401,15 @@ export function openDesktopShell(
       const maximized = w.isMaximized()
       if (wasMaximized && !maximized) {
         // If the user saved a custom size while maximized, restore to that
-        // size; otherwise restore to the default 3/4 of the screen.
-        const restored = pendingCustomSize ?? defaultSize()
+        // size; otherwise restore to the startup/restore size (saved size or
+        // 3/4 of the screen) — one unified restore path.
+        const restored = pendingCustomSize ?? restoreSize()
         pendingCustomSize = undefined
         try {
-          w.setSize(restored.width, restored.height, true)
+          // pendingCustomSize is logical; restoreSize carries its own unit
+          // (saved = logical, 3/4 default = physical). Passing the flag keeps
+          // the restored window inside the screen at any DPI scaling.
+          w.setSize(restored.width, restored.height, restored.logical)
           w.center()
         } catch {
           // Best-effort; the window is already restored to the OS default.
@@ -467,7 +514,7 @@ export function openDesktopShell(
   const dispatchEvent = (name: string, detail: Record<string, unknown> = {}): void => {
     if (webview === undefined || webview.isDisposed()) return
     const startedAt = Date.now()
-    console.log(`[mg-dsh-desktop] dispatch start ${name} at ${startedAt}`)
+    console.log(`[dsh-hub] dispatch start ${name} at ${startedAt}`)
     const js = dispatchScript(name, detail)
     let tries = 0
     const attempt = (): void => {
@@ -475,12 +522,12 @@ export function openDesktopShell(
       if (wv === undefined || wv.isDisposed()) return
       wv.evaluateScriptWithCallback(js, (error, result) => {
         if (error) {
-          console.warn(`[mg-dsh-desktop] dispatch ${name} failed:`, error)
+          console.warn(`[dsh-hub] dispatch ${name} failed:`, error)
           return
         }
         const status = result?.trim()
         if (status === '1') {
-          console.log(`[mg-dsh-desktop] dispatched ${name} in ${Date.now() - startedAt}ms`)
+          console.log(`[dsh-hub] dispatched ${name} in ${Date.now() - startedAt}ms`)
           return
         }
         // 20 × 300ms covers a cold SPA boot; by then the page's client
@@ -489,7 +536,7 @@ export function openDesktopShell(
           tries += 1
           setTimeout(attempt, 300)
         } else {
-          console.warn(`[mg-dsh-desktop] dispatch ${name} never reached a ready page (${Date.now() - startedAt}ms)`)
+          console.warn(`[dsh-hub] dispatch ${name} never reached a ready page (${Date.now() - startedAt}ms)`)
         }
       })
     }
@@ -551,6 +598,8 @@ export function openDesktopShell(
   let activeNotification: Notification | undefined
   /** Timestamp of the last shown task toast (cooldown bookkeeping). */
   let lastNotifiedAt = 0
+  /** The session the web UI reports as currently focused (see IPC handler). */
+  let focusedSessionId: string | undefined
 
   const shell: DesktopShellHandle = {
     app,
@@ -567,7 +616,8 @@ export function openDesktopShell(
         if (win.isMaximized()) {
           // Saving a custom size while maximized: exit maximize first and let
           // the resize handler apply the requested size (via pendingCustomSize).
-          pendingCustomSize = { width, height }
+          // Settings sizes are logical; the resize handler honors the flag.
+          pendingCustomSize = { width, height, logical: true }
           win.setMaximized(false)
         }
         win.setSize(width, height, true)
@@ -601,24 +651,30 @@ export function openDesktopShell(
       }, 2000)
     },
     dispatchEvent,
-    notifyTaskComplete: (body: string) => {
+    playSound: (kind: TaskSoundKind) => {
+      playTaskSound(kind)
+    },
+    notifyTaskComplete: (body: string, opts?: { sessionId?: string }) => {
       try {
-        // Only remind when the user is NOT looking at the window: a toast
-        // while the shell is visible in the foreground is noise, not a
-        // reminder. Hidden-to-tray and minimized windows still notify.
+        // Only remind when the user is NOT already looking at the finished
+        // session: a toast while the shell is visible AND focused on that
+        // session is noise (the completion is right there). Hidden-to-tray
+        // and minimized windows, and any session the user is not watching,
+        // still toast.
         const watching = win !== undefined
           && !win.isDisposed()
           && win.isVisible()
           && !win.isMinimized()
-        if (watching) {
-          console.log('[mg-dsh-desktop] task complete while window visible; skipping toast')
+        const focused = opts?.sessionId !== undefined && opts.sessionId === focusedSessionId
+        if (watching && focused) {
+          console.log('[dsh-hub] task complete for the focused session; sound only (no toast)')
           return
         }
         // Spam guard: at most one toast per cooldown window, so a burst of
         // completed turns does not stack toasts.
         const now = Date.now()
         if (now - lastNotifiedAt < NOTIFY_COOLDOWN_MS) {
-          console.log('[mg-dsh-desktop] task toast throttled by cooldown')
+          console.log('[dsh-hub] task toast throttled by cooldown')
           return
         }
         lastNotifiedAt = now
@@ -630,14 +686,14 @@ export function openDesktopShell(
         // (ERR_UNHANDLED_ERROR), so subscribe before anything can fire. A
         // disabled-notifications OS setting arrives here as a benign error.
         notification.on('error', (event) => {
-          console.warn(`[mg-dsh-desktop] task notification error:`, event.error?.message ?? event.error)
+          console.warn(`[dsh-hub] task notification error:`, event.error?.message ?? event.error)
         })
         notification.onclick = () => showWindow()
         notification.onclose = () => {
           if (activeNotification === notification) activeNotification = undefined
         }
       } catch (error) {
-        console.warn(`[mg-dsh-desktop] task notification failed:`, error)
+        console.warn(`[dsh-hub] task notification failed:`, error)
       }
     },
     dispose: () => {

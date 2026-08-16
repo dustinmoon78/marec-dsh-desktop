@@ -8,7 +8,7 @@
  * The `default` skin is not an entry: it means "no override" and removes the
  * injected stylesheet entirely.
  */
-/** One semantic token override (token name without the leading `--`). */
+/** One semantic token override (alias token name without the leading `--dsw-alias-`). */
 export interface Palette {
     [token: string]: string;
 }
@@ -17,8 +17,18 @@ export interface DshSkin {
     id: string;
     name: string;
     description: string;
+    /** `--dsw-alias-*` overrides (the main semantic tokens). */
     light: Palette;
     dark: Palette;
+    /**
+     * `--dsw-specific-*` overrides — surfaces the alias tokens do not drive
+     * (sidebar surface, sidebar nav item states, floating menus). Kept
+     * separate so alias keys stay short and the specific set is explicit.
+     */
+    specific: {
+        light: Palette;
+        dark: Palette;
+    };
 }
 /**
  * The built-in skins. Palettes are original compositions over the dsw alias
@@ -34,5 +44,9 @@ export declare function findSkin(id: string): DshSkin | undefined;
  * element in the document head. Removing is a no-op when nothing was injected.
  */
 export declare function applySkin(skinId: string): void;
+/** Mark that the user explicitly picked a skin (settings card onPickSkin). */
+export declare function markSkinUserPicked(): void;
+/** Whether the user already picked a skin in this page lifetime. */
+export declare function hasUserPickedSkin(): boolean;
 /** Read the persisted skin id through the plugin's config API. */
 export declare function fetchStoredSkin(): Promise<string>;

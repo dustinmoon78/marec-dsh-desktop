@@ -13,7 +13,7 @@ import { isAbsolute, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 
-const API_PREFIX = '/api/mg-dsh-desktop/workspace'
+const API_PREFIX = '/api/dsh-hub/workspace'
 const MAX_ENTRIES = 1000
 const GIT_TIMEOUT_MS = 3000
 
@@ -88,13 +88,19 @@ function gitOutput(path: string, args: string[]): Promise<string> {
   })
 }
 
-/** Detect git repo state and working-tree changes. */
+/**
+ * Detect git repo state and working-tree changes. `branch` is the current
+ * branch name (the short hash when detached); `head` is ALWAYS the short
+ * commit hash (`rev-parse --short HEAD`) — the client shows a commit
+ * identifier, and the branch name must not masquerade as one (A6).
+ */
 async function gitInfo(path: string): Promise<GitInfo> {
   const inWork = await gitOutput(path, ['rev-parse', '--is-inside-work-tree'])
   if (inWork !== 'true') return { isGit: false, branch: '', head: '', changes: [] }
 
+  const head = await gitOutput(path, ['rev-parse', '--short', 'HEAD'])
   let branch = await gitOutput(path, ['branch', '--show-current'])
-  if (branch === '') branch = await gitOutput(path, ['rev-parse', '--short', 'HEAD'])
+  if (branch === '') branch = head // detached HEAD
 
   const raw = await gitOutput(path, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'])
   const changes: GitChange[] = raw === ''
@@ -107,7 +113,7 @@ async function gitInfo(path: string): Promise<GitInfo> {
         return { path: filePath, status }
       })
 
-  return { isGit: true, branch, head: branch, changes }
+  return { isGit: true, branch, head, changes }
 }
 
 /** Build the workspace API routes (list + git). */

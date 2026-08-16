@@ -1,12 +1,12 @@
 /**
- * mg-dsh-desktop browser half — registers a settings card into the dsh
+ * dsh-hub browser half — registers a settings card into the dsh
  * settings → plugins page and bridges tray commands from the desktop shell.
  *
  * The card reads/writes the shell config through this plugin's own HTTP
  * routes, so it works without dsh's settings namespace allowlist (which does
  * not expose third-party namespaces yet). The card renders only while the
  * host serves the config API, which happens only when the process was
- * launched by this project (desktop shortcut / `mg-dsh`); a plain
+ * launched by this project (desktop shortcut / `dsh-hub`); a plain
  * command-line `dsh web` never mounts the bundle at all.
  *
  * The tray bridge: the desktop shell dispatches tray commands into the page
@@ -17,7 +17,7 @@
  * dsh-pet): declare the slot shape, then `slots.inject('settings.plugin.item',
  * ...)`.
  *
- * @module mg-dsh-desktop/client
+ * @module dsh-hub/client
  */
 
 import { createElement } from 'react'
@@ -30,7 +30,8 @@ import { DesktopSettingsCard, type DesktopSettingsCardProps } from './settings-c
 import { injectCardStyle } from './style.ts'
 import { RightSidebar } from './right-sidebar.tsx'
 import { injectRightSidebarStyle } from './right-sidebar-style.ts'
-import { applySkin, fetchStoredSkin } from './skins.ts'
+import { applySkin, fetchStoredSkin, hasUserPickedSkin } from './skins.ts'
+import { applyBackground, fetchStoredBackground, hasUserPickedBackground } from './backgrounds.ts'
 import { installPinnedConversations } from './pin-conversations.ts'
 
 /**
@@ -125,10 +126,10 @@ function handleShellCommand(ctx: ClientContext, event: Event): void {
     workspaces?: { startSession?: () => void }
   }).workspaces
   if (workspaces === undefined || workspaces.startSession === undefined) {
-    console.warn('[mg-dsh-desktop] new-task ignored: workspaces service unavailable')
+    console.warn('[dsh-hub] new-task ignored: workspaces service unavailable')
     return
   }
-  console.log('[mg-dsh-desktop] new-task (current session workspace)')
+  console.log('[dsh-hub] new-task (current session workspace)')
   workspaces.startSession()
 }
 
@@ -137,7 +138,20 @@ export function apply(ctx: ClientContext): void {
   // Tray → page bridge listener, registered before anything fallible: the
   // shell retries its dispatch until __mgShellReady, so a listener that
   // never registers (card injection failure) would look like a dead button.
-  window.addEventListener('mg:shell-command', (event) => handleShellCommand(ctx, event))
+  // The effect disposer removes it on reload (HMR / include.refresh), so a
+  // re-install never stacks duplicate handlers.
+  try {
+    ctx.effect(() => {
+      const listener = (event: Event): void => handleShellCommand(ctx, event)
+      window.addEventListener('mg:shell-command', listener)
+      return () => window.removeEventListener('mg:shell-command', listener)
+    }, 'dsh-hub: tray shell-command bridge')
+  } catch (error) {
+    // ctx.effect unusable (unexpected) — fall back to an unmanaged listener
+    // so the tray button still works; this path is not expected in practice.
+    console.warn('[dsh-hub] shell-command effect failed, using unmanaged listener:', error)
+    window.addEventListener('mg:shell-command', (event) => handleShellCommand(ctx, event))
+  }
 
   // Expose page functions for the current workspace: one sends the path over
   // IPC to the desktop host (tray "Open workspace"), one returns it directly
@@ -147,6 +161,38 @@ export function apply(ctx: ClientContext): void {
   ;(window as unknown as { __mgGetCurrentWorkspace?: () => string | null }).__mgGetCurrentWorkspace
     = () => currentWorkspace(ctx)?.path ?? null
 
+  // Report the focused session to the desktop host over IPC so its toast
+  // policy can tell "watching the finished session" (sound only) apart from
+  // "watching another session" (toast too). `ctx.sessions.list.current` is
+  // the persisted current selection — the session the UI is showing. The
+  // list store republishes on any summary change, so a last-sent cache keeps
+  // the channel quiet unless the focus actually moved.
+  let lastSentFocus: string | undefined
+  const reportFocus = (): void => {
+    try {
+      const client = ctx as unknown as {
+        sessions?: { list?: { getSnapshot?: () => { current?: string } } }
+      }
+      const current = client.sessions?.list?.getSnapshot?.()?.current
+      if (current === lastSentFocus) return
+      lastSentFocus = current
+      const ipc = (window as unknown as { ipc?: { postMessage(message: string): void } }).ipc
+      ipc?.postMessage(`mg:session-focus:${current === undefined ? '' : encodeURIComponent(current)}`)
+    } catch {
+      // Best-effort; the host falls back to always-toast when focus is unknown.
+    }
+  }
+  reportFocus()
+  try {
+    const list = (ctx as unknown as {
+      sessions?: { list?: { subscribe?: (callback: () => void) => () => void } }
+    }).sessions?.list
+    const unsubscribe = list?.subscribe?.(reportFocus)
+    ctx.effect(() => () => unsubscribe?.(), 'dsh-hub: session focus reporter')
+  } catch (error) {
+    console.warn('[dsh-hub] session focus reporter failed:', error)
+  }
+
   const slots = ctx.get('slots')
   if (slots === undefined) return
 
@@ -154,20 +200,32 @@ export function apply(ctx: ClientContext): void {
   injectCardStyle()
   injectRightSidebarStyle()
 
-  // Restore the persisted skin once the config API is reachable.
-  void fetchStoredSkin().then((skinId) => applySkin(skinId))
+  // Restore the persisted skin once the config API is reachable. If the user
+  // already picked a skin in this page lifetime (settings card), the restore
+  // must not clobber it — the flag makes the race harmless.
+  void fetchStoredSkin().then((skinId) => {
+    if (hasUserPickedSkin()) return
+    applySkin(skinId)
+  })
+
+  // Same for the background image: restore the saved choice unless the user
+  // already picked one in this page lifetime.
+  void fetchStoredBackground().then((backgroundId) => {
+    if (hasUserPickedBackground()) return
+    applyBackground(backgroundId)
+  })
 
   try {
     slots.inject('settings.plugin.item', function* () {
       yield slots.register({
         name: 'settings.plugin.item',
-        id: 'mg-dsh-desktop',
+        id: 'dsh-hub',
         order: 30,
       }, (props: DesktopSettingsCardProps) => DesktopSettingsCard(props))
     })
   } catch (error) {
     // Card mounting must never take down the tray bridge.
-    console.warn('[mg-dsh-desktop] settings card injection failed:', error)
+    console.warn('[dsh-hub] settings card injection failed:', error)
   }
 
   // Right sidebar: mount a body portal like dsh-better-sidebar. This keeps
@@ -177,8 +235,8 @@ export function apply(ctx: ClientContext): void {
   try {
     ctx.effect(() => {
       const host = document.createElement('div')
-      host.id = 'mg-dsh-desktop-right-sidebar-root'
-      host.setAttribute('data-mg-dsh-desktop-right-sidebar', '')
+      host.id = 'dsh-hub-right-sidebar-root'
+      host.setAttribute('data-dsh-hub-right-sidebar', '')
       document.body.appendChild(host)
       const root: Root = createRoot(host)
       root.render(createElement(RightSidebar, { ctx }))
@@ -186,18 +244,17 @@ export function apply(ctx: ClientContext): void {
         root.unmount()
         host.remove()
       }
-    }, 'mg-dsh-desktop: right sidebar mount')
+    }, 'dsh-hub: right sidebar mount')
   } catch (error) {
-    console.warn('[mg-dsh-desktop] right sidebar mount failed:', error)
+    console.warn('[dsh-hub] right sidebar mount failed:', error)
   }
 
-  // Pinned conversations: add a 置顶 toggle to each sidebar session row and a
-  // pinned section at the top of the session list. Self-contained module that
-  // waits for the sidebar slot to appear; the disposer tears it down when the
-  // plugin fiber unloads.
+  // Pinned conversations (置顶会话): augment the official session list with
+  // stable anchors (no CSS-module hashes). The effect disposer tears down all
+  // injected DOM on reload, so HMR / include.refresh rebuild cleanly.
   try {
-    ctx.effect(() => installPinnedConversations(ctx), 'mg-dsh-desktop: pinned conversations')
+    ctx.effect(() => installPinnedConversations(ctx), 'dsh-hub: pinned conversations')
   } catch (error) {
-    console.warn('[mg-dsh-desktop] pinned conversations mount failed:', error)
+    console.warn('[dsh-hub] pinned conversations install failed:', error)
   }
 }
