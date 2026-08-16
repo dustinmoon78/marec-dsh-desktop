@@ -31,6 +31,7 @@ import { injectCardStyle } from './style.ts'
 import { RightSidebar } from './right-sidebar.tsx'
 import { injectRightSidebarStyle } from './right-sidebar-style.ts'
 import { applySkin, fetchStoredSkin } from './skins.ts'
+import { installPinnedConversations } from './pin-conversations.ts'
 
 /**
  * Tray-bridge ready flag, set at module scope — the very first thing that
@@ -188,5 +189,15 @@ export function apply(ctx: ClientContext): void {
     }, 'mg-dsh-desktop: right sidebar mount')
   } catch (error) {
     console.warn('[mg-dsh-desktop] right sidebar mount failed:', error)
+  }
+
+  // Pinned conversations: add a 置顶 toggle to each sidebar session row and a
+  // pinned section at the top of the session list. Self-contained module that
+  // waits for the sidebar slot to appear; the disposer tears it down when the
+  // plugin fiber unloads.
+  try {
+    ctx.effect(() => installPinnedConversations(ctx), 'mg-dsh-desktop: pinned conversations')
+  } catch (error) {
+    console.warn('[mg-dsh-desktop] pinned conversations mount failed:', error)
   }
 }
